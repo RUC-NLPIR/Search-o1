@@ -163,6 +163,47 @@ python scripts/run_search_o1.py \
     --bing_subscription_key "YOUR_BING_SUBSCRIPTION_KEY"
 ```
 
+#### Search without API keys
+
+`run_search_o1.py` uses [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+when no Bing key or endpoint is supplied. It provides free web search in Fast
+mode and page excerpts for the Reason-in-Documents step, without an account or
+API key. After installing the requirements and preparing your dataset, run:
+
+```bash
+python scripts/run_search_o1.py \
+    --dataset_name aime \
+    --split test \
+    --model_path "YOUR_MODEL_PATH"
+```
+
+Use `--search_provider parallel` to select Parallel explicitly. Supplying
+`--bing_subscription_key` keeps the existing Bing search and Jina fetching path;
+`--search_provider bing` selects it explicitly and requires that key. A supplied
+`--bing_endpoint` also selects Bing in auto mode. Provider errors are reported
+without switching providers. The other inference scripts continue to use Bing.
+
+Parallel uses `https://search.parallel.ai/mcp` for both search and fetching focused
+page excerpts; it does not use Jina or read API keys from the environment. Requests
+time out after 20 seconds of inactivity, and Ctrl-C stops the run. Free anonymous
+usage has service limits; quota errors are surfaced to the reasoning step. Each
+question has its own opaque conversation ID, reused for its searches and fetches.
+Parallel caches are stored separately in `cache/parallel/`; remove that directory
+to refresh its cached results. Existing Bing caches stay in `cache/`.
+
+`--max_search_limit 0` disables searches for the reasoning datasets (such as AIME).
+Open-domain QA datasets retain their existing dataset-specific limits.
+
+The search integration tests run without GPU/model dependencies:
+
+```bash
+pip install requests beautifulsoup4 pdfplumber nltk numpy tqdm
+python -m unittest discover -s tests -v
+```
+
+The agent-loop tests use scripted model outputs. Set `SEARCH_O1_LIVE_MCP=1` to
+also exercise the CLI loop with live anonymous MCP search and fetch requests.
+
 **Parameters Explanation:**
 - `--dataset_name`: Name of the dataset to use (e.g., gpqa, aime).
 - `--split`: Data split to run (e.g., train, test, diamond).
