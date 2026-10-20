@@ -9,6 +9,9 @@ import torch
 import string
 from typing import Optional, Tuple, List, Dict
 import argparse
+import uuid
+
+from parallel_search import ParallelSearch, resolve_search_provider
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
@@ -156,18 +159,23 @@ def parse_args():
         help="Maximum number of tokens to generate. If not set, defaults based on the model and dataset."
     )
 
+    parser.add_argument(
+        '--search_provider', choices=['auto', 'parallel', 'bing'], default='auto',
+        help='auto uses Parallel without keys, or Bing when a Bing key/endpoint is supplied.'
+    )
+
     # Bing API Configuration
     parser.add_argument(
         '--bing_subscription_key',
         type=str,
-        required=True,
+        default=None,
         help="Bing Search API subscription key."
     )
 
     parser.add_argument(
         '--bing_endpoint',
         type=str,
-        default="https://api.bing.microsoft.com/v7.0/search",
+        default=None,
         help="Bing Search API endpoint."
     )
 
@@ -175,6 +183,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    provider = resolve_search_provider(
+        args.search_provider, args.bing_subscription_key, args.bing_endpoint
+    )
+    parallel = ParallelSearch() if provider == 'parallel' else None
 
     # Extract arguments
     dataset_name = args.dataset_name
@@ -191,7 +203,7 @@ def main():
     repetition_penalty = args.repetition_penalty
     max_tokens = args.max_tokens
     bing_subscription_key = args.bing_subscription_key
-    bing_endpoint = args.bing_endpoint
+    bing_endpoint = args.bing_endpoint or "https://api.bing.microsoft.com/v7.0/search"
     use_jina = args.use_jina
     jina_api_key = args.jina_api_key
     
@@ -225,7 +237,7 @@ def main():
 
     # ---------------------- Caching Mechanism ----------------------
     # Define cache directories and file paths
-    cache_dir = './cache'
+    cache_dir = './cache/parallel' if parallel else './cache'
     search_cache_path = os.path.join(cache_dir, 'search_cache.json')
     url_cache_path = os.path.join(cache_dir, 'url_cache.json')
 
@@ -244,6 +256,10 @@ def main():
             url_cache = json.load(f)
     else:
         url_cache = {}
+
+    def page_cache_key(url, query):
+        # Parallel returns query-focused excerpts, not a query-independent page.
+        return json.dumps([query, url], ensure_ascii=False) if parallel else url
 
     # Function to save caches
     def save_caches():
@@ -381,6 +397,7 @@ def main():
         'finished': False,
         'history': [],
         'search_count': 0,
+        'search_session_id': str(uuid.uuid4()),
         'executed_search_queries': set(),
     } for item, prompt in zip(filtered_data, input_list)]
 
@@ -515,7 +532,7 @@ def main():
             # Collect URLs to fetch across all sequences
             all_urls_to_fetch = set()
             url_snippets = {}
-            url_sequence_map = {}  # Map URL to list of sequences needing it
+            parallel_fetches = []  # Preserve each question's MCP context in a batch
 
             # Process each sequence and collect URLs
             for seq, out in zip(sequences_needing_generation, outputs):
@@ -531,19 +548,23 @@ def main():
                 # If a search query is present and needs to be executed
                 if search_query and seq['output'].rstrip().endswith(END_SEARCH_QUERY):
                     if seq['search_count'] < MAX_SEARCH_LIMIT and search_query not in seq['executed_search_queries']:
+                        seq['current_search_query'] = search_query
                         # Execute search, use cache if available
                         if search_query in search_cache:
                             results = search_cache[search_query]
                             print(f"Using cached search results for query: \"{search_query}\"")
                         else:
                             try:
-                                results = bing_web_search(search_query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
+                                if parallel:
+                                    results = parallel.search(search_query, seq['search_session_id'])
+                                else:
+                                    results = bing_web_search(search_query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
                                 search_cache[search_query] = results
                                 print(f"Executed and cached search for query: \"{search_query}\"")
                             except Exception as e:
                                 print(f"Error during search query '{search_query}': {e}")
-                                search_cache[search_query] = {}
                                 results = {}
+                                seq['search_error'] = f"Search failed: {e}"
 
                         # Extract relevant information from Bing search results
                         relevant_info = extract_relevant_info(results)[:top_k]
@@ -554,8 +575,10 @@ def main():
                         snippets = {info['url']: info['snippet'] for info in relevant_info if 'snippet' in info}
 
                         # Filter URLs that are not cached
-                        urls_to_fetch_filtered = [u for u in urls_to_fetch if u not in url_cache]
-                        cached_urls = [u for u in urls_to_fetch if u in url_cache]
+                        urls_to_fetch_filtered = [u for u in urls_to_fetch
+                                                  if page_cache_key(u, search_query) not in url_cache]
+                        if parallel and urls_to_fetch_filtered:
+                            parallel_fetches.append((seq, urls_to_fetch_filtered, search_query))
 
                         # Store info for all_urls_to_fetch and url_snippets
                         for url in urls_to_fetch_filtered:
@@ -616,12 +639,20 @@ def main():
             if all_urls_to_fetch:
                 print(f"Fetching {len(all_urls_to_fetch)} URLs...")
                 try:
-                    fetched_contents = fetch_page_content(
-                        list(all_urls_to_fetch),
-                        use_jina=use_jina,
-                        jina_api_key=jina_api_key,
-                        # snippets=url_snippets  # Do not pass snippets when updating url_cache directly
-                    )
+                    if parallel:
+                        fetched_contents = {}
+                        for seq, urls, query in parallel_fetches:
+                            try:
+                                contents = parallel.fetch(urls, query, seq['search_session_id'])
+                                fetched_contents.update({page_cache_key(url, query): text
+                                                         for url, text in contents.items()})
+                            except Exception as e:
+                                seq['search_error'] = f"Page fetch failed: {e}"
+                    else:
+                        fetched_contents = fetch_page_content(
+                            list(all_urls_to_fetch), use_jina=use_jina,
+                            jina_api_key=jina_api_key,
+                        )
                     print(f"Fetched {len(fetched_contents)} URLs successfully.")
                 except Exception as e:
                     print(f"Error during batch URL fetching: {e}")
@@ -631,11 +662,11 @@ def main():
                     url_cache[url] = content
 
             # After fetching, prepare formatted documents for batch processing
-            for relevant_info in batch_relevant_info:
-                formatted_documents = ""
+            for relevant_info, seq in zip(batch_relevant_info, batch_sequences):
+                formatted_documents = seq.pop('search_error', '')
                 for i, doc_info in enumerate(relevant_info):
                     url = doc_info['url']
-                    raw_context = url_cache.get(url, "")
+                    raw_context = url_cache.get(page_cache_key(url, seq['current_search_query'])) or doc_info['snippet']
                     doc_info['snippet'] = doc_info['snippet'].replace('<b>','').replace('</b>','')            
                     success, filtered_context = extract_snippet_with_context(raw_context, doc_info['snippet'], context_chars=max_doc_len)
                     if success:
